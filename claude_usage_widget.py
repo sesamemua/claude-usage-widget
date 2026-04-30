@@ -30,10 +30,11 @@ ROW_GAP = 2
 DRAG_TAB_W = 10
 BTN_W = 18
 
-# Variable bar widths — session is widest to fit "4h 10m · 4:39am"
+# All three sections share the same width (matches the session bar so its
+# longest reset string "4h 10m · 4:39am" fits comfortably).
 SESSION_BAR_W = 195
-ALL_BAR_W = 132
-SONNET_BAR_W = 110  # bumped per user request (20% longer)
+ALL_BAR_W = SESSION_BAR_W
+SONNET_BAR_W = SESSION_BAR_W
 COUNTDOWN_W = 44
 
 # Horizontal: [pad][tab][gap][session][gap][all][gap][sonnet][gap][⏱][gap][↻⇌×][pad]
