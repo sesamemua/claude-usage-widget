@@ -33,7 +33,7 @@ BTN_W = 18
 # Variable bar widths — session is widest to fit "4h 10m · 4:39am"
 SESSION_BAR_W = 195
 ALL_BAR_W = 132
-SONNET_BAR_W = 92  # bumped a bit per user request
+SONNET_BAR_W = 110  # bumped per user request (20% longer)
 COUNTDOWN_W = 44
 
 # Horizontal: [pad][tab][gap][session][gap][all][gap][sonnet][gap][⏱][gap][↻⇌×][pad]
