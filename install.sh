@@ -1,22 +1,35 @@
 #!/usr/bin/env bash
 # Claude Usage Widget — installer
-# Builds a macOS .app bundle and copies it into /Applications.
+# Builds a macOS .app bundle with a self-contained virtualenv and copies it
+# into /Applications. The venv lives inside the bundle so the launcher never
+# depends on a Python path that might later be uninstalled.
 
 set -euo pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Claude Usage"
 APP_BUNDLE="/Applications/${APP_NAME}.app"
-PYTHON_BIN="$(command -v python3)"
 
-if [[ -z "${PYTHON_BIN}" ]]; then
-    echo "Error: python3 not found in PATH." >&2
+# Find a working python3 to seed the venv from. We try a few candidates and
+# verify each one actually runs (a bare `command -v` can resolve to a dangling
+# symlink left behind by an uninstalled Python).
+find_python() {
+    for cand in python3.13 python3.12 python3.11 python3 /usr/bin/python3; do
+        local p
+        p="$(command -v "${cand}" 2>/dev/null || true)"
+        if [[ -n "${p}" ]] && "${p}" -c 'import sys' >/dev/null 2>&1; then
+            echo "${p}"
+            return 0
+        fi
+    done
+    return 1
+}
+
+PYTHON_BIN="$(find_python)" || {
+    echo "Error: no working python3 found in PATH." >&2
     exit 1
-fi
-
-echo "==> Installing Python dependencies"
-"${PYTHON_BIN}" -m pip install --upgrade pip
-"${PYTHON_BIN}" -m pip install --upgrade pyobjc-framework-WebKit pyobjc-framework-Cocoa
+}
+echo "==> Using base Python: ${PYTHON_BIN} ($("${PYTHON_BIN}" --version 2>&1))"
 
 echo "==> Removing any existing ${APP_NAME}.app"
 rm -rf "${APP_BUNDLE}"
@@ -33,6 +46,13 @@ if [[ -f "${REPO_DIR}/AppIcon.icns" ]]; then
     cp "${REPO_DIR}/AppIcon.icns" \
        "${APP_BUNDLE}/Contents/Resources/AppIcon.icns"
 fi
+
+echo "==> Creating self-contained virtualenv (inside the bundle)"
+VENV="${APP_BUNDLE}/Contents/Resources/venv"
+"${PYTHON_BIN}" -m venv "${VENV}"
+"${VENV}/bin/python" -m pip install --upgrade pip >/dev/null
+echo "==> Installing Python dependencies into the venv"
+"${VENV}/bin/python" -m pip install pyobjc-framework-WebKit pyobjc-framework-Cocoa
 
 cat > "${APP_BUNDLE}/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -55,10 +75,12 @@ cat > "${APP_BUNDLE}/Contents/Info.plist" <<EOF
 </plist>
 EOF
 
-cat > "${APP_BUNDLE}/Contents/MacOS/launcher" <<EOF
+# The launcher resolves Python relative to its own location, so the path is
+# always valid as long as the bundle exists — no absolute system path to break.
+cat > "${APP_BUNDLE}/Contents/MacOS/launcher" <<'EOF'
 #!/bin/bash
-DIR="\$(cd "\$(dirname "\$0")/../Resources" && pwd)"
-exec ${PYTHON_BIN} "\$DIR/claude_usage_widget.py"
+DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+exec "$DIR/venv/bin/python" "$DIR/claude_usage_widget.py"
 EOF
 chmod +x "${APP_BUNDLE}/Contents/MacOS/launcher"
 

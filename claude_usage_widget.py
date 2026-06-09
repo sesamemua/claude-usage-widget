@@ -92,21 +92,47 @@ def save_prefs(prefs):
     except Exception:
         pass
 
+# claude.ai/settings/usage is a lazy-loading SPA. The usage panel shows
+# "Loading" placeholders for a few seconds, then renders text like:
+#   Current session / Resets in 3 hr 8 min / 23% used
+#   All models      / Resets Tue 11:00 AM   / 3% used
+#   Sonnet only     / You haven't used Sonnet yet / 0% used   (no "Resets" line
+#                                                              when a metric is
+#                                                              unused)
+# We slice the body per section (header → next header) and pull the percentage
+# whether or not a "Resets" line is present, so unused metrics still parse.
 EXTRACT_JS = r"""
 (function() {
     var data = {loggedIn: false};
     var body = document.body ? document.body.innerText : '';
     if (body.indexOf('% used') === -1) return JSON.stringify(data);
     data.loggedIn = true;
-    var m = body.match(/Current session[\s\S]*?Resets in ([^\n]+)[\s\S]*?(\d+)% used/);
-    if (m) { data.sPct = parseInt(m[2]); data.sReset = m[1].trim(); }
-    m = body.match(/All models[\s\S]*?Resets ([^\n]+)[\s\S]*?(\d+)% used/);
-    if (m) { data.aPct = parseInt(m[2]); data.aReset = m[1].trim(); }
-    var s = body.substring(body.indexOf('Sonnet only'));
-    m = s.match(/Sonnet only[\s\S]*?Resets ([^\n]+)[\s\S]*?(\d+)% used/);
-    if (m) { data.nPct = parseInt(m[2]); data.nReset = m[1].trim(); }
-    m = body.match(/Max \(([^)]+)\)/);
-    if (m) data.plan = m[1];
+    function section(label, stops) {
+        var i = body.indexOf(label);
+        if (i === -1) return null;
+        var rest = body.substring(i + label.length);
+        var cut = rest.length;
+        for (var k = 0; k < stops.length; k++) {
+            var j = rest.indexOf(stops[k]);
+            if (j !== -1 && j < cut) cut = j;
+        }
+        rest = rest.substring(0, cut);
+        var pm = rest.match(/(\d+)%\s*used/);
+        var rm = rest.match(/Resets(?:\s+in)?\s+([^\n]+)/);
+        return {pct: pm ? parseInt(pm[1], 10) : null,
+                reset: rm ? rm[1].trim() : ""};
+    }
+    var sess = section('Current session',
+        ['All models', 'Weekly limits', 'Sonnet only', 'Last updated']);
+    if (sess && sess.pct !== null) { data.sPct = sess.pct; data.sReset = sess.reset; }
+    var all = section('All models',
+        ['Sonnet only', 'Last updated', 'Additional features']);
+    if (all && all.pct !== null) { data.aPct = all.pct; data.aReset = all.reset; }
+    var son = section('Sonnet only',
+        ['Last updated', 'Additional features', 'Usage credits']);
+    if (son && son.pct !== null) { data.nPct = son.pct; data.nReset = son.reset; }
+    var pm = body.match(/Max \(([^)]+)\)/);
+    if (pm) data.plan = pm[1];
     return JSON.stringify(data);
 })()
 """
@@ -128,6 +154,9 @@ g_last_data = {}           # last fetched data, used to repopulate menubar item
 g_countdown = None         # CountdownView instance
 g_last_refresh_time = 0.0  # time.time() of last successful page reload
 g_refresh_timer = None     # Foundation.NSTimer for auto-refresh
+g_extract_timer = None     # repeating timer that polls for data after a load
+g_extract_tries = 0        # poll attempts since the last page load
+g_reload_retries = 0       # reloads triggered because a load surfaced no data
 
 
 def get_refresh_interval():
@@ -198,16 +227,37 @@ def menubar_color_for_pct(pct):
 
 
 # ── Custom views ──
+#
+# IMPORTANT: macOS 26 does not composite custom NSView drawRect_ output for
+# subviews of a borderless, transparent window — only AppKit controls
+# (NSButton, NSTextField) and layer-backed views with a backgroundColor render.
+# So the widget's content is built from those primitives, not from drawRect_.
+
+
+def _clear_label(font_size, white=1.0):
+    """A non-interactive NSTextField label with a transparent background."""
+    tf = AppKit.NSTextField.labelWithString_("")
+    tf.setFont_(AppKit.NSFont.systemFontOfSize_(font_size))
+    tf.setTextColor_(AppKit.NSColor.colorWithCalibratedWhite_alpha_(white, 1.0))
+    tf.setDrawsBackground_(False)
+    tf.setBezeled_(False)
+    tf.setEditable_(False)
+    tf.setSelectable_(False)
+    return tf
+
+
+def _ns_cgcolor(nscolor):
+    return nscolor.CGColor()
+
 
 class MetricBarView(AppKit.NSView):
-    """Single-line metric: text on top + thick gradient line below."""
-
-    LINE_H = 4
-    LINE_PAD_X = 3
-    LINE_BOTTOM_Y = 1
+    """Single-line metric: a dark rounded track, a colored progress line, and
+    text — all as AppKit subviews so they composite on macOS 26."""
 
     def initWithFrame_label_(self, frame, label):
         self = objc.super(MetricBarView, self).initWithFrame_(frame)
+        if self is None:
+            return None
         self._label = label
         self._key = None
         self._pct = None
@@ -215,111 +265,95 @@ class MetricBarView(AppKit.NSView):
         self._compact = False     # vertical mode = compact (percentage only)
         self._barColor = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
             *NEON_BLUE, 1.0)
+        w, h = frame.size.width, frame.size.height
+
+        # Dark rounded track slot
+        self._track = AppKit.NSView.alloc().initWithFrame_(
+            Foundation.NSMakeRect(0, 0, w, h))
+        self._track.setWantsLayer_(True)
+        self._track.setAutoresizingMask_(
+            AppKit.NSViewWidthSizable | AppKit.NSViewHeightSizable)
+        self._track.layer().setCornerRadius_(4)
+        self._track.layer().setBackgroundColor_(_ns_cgcolor(
+            AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.04, 0.06, 0.13, 1.0)))
+        self.addSubview_(self._track)
+
+        # Colored progress line near the bottom
+        self._line = AppKit.NSView.alloc().initWithFrame_(
+            Foundation.NSMakeRect(5, 2, 0, 2))
+        self._line.setWantsLayer_(True)
+        self._line.layer().setCornerRadius_(1)
+        self.addSubview_(self._line)
+
+        # Text labels (left = label+pct, right = reset time)
+        self._textLabel = _clear_label(9.5)
+        self.addSubview_(self._textLabel)
+        self._resetLabel = _clear_label(8.5, white=0.98)
+        self._resetLabel.setAlignment_(AppKit.NSTextAlignmentRight)
+        self.addSubview_(self._resetLabel)
+
+        self._layoutLabels()
         return self
+
+    def _layoutLabels(self):
+        b = self.bounds()
+        if self._compact:
+            self._textLabel.setAlignment_(AppKit.NSTextAlignmentCenter)
+            self._textLabel.setFont_(
+                AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(8.5, 0.0))
+            self._textLabel.setFrame_(Foundation.NSMakeRect(
+                0, (b.size.height - 12) / 2.0, b.size.width, 12))
+            self._resetLabel.setHidden_(True)
+        else:
+            self._textLabel.setAlignment_(AppKit.NSTextAlignmentLeft)
+            self._textLabel.setFont_(AppKit.NSFont.systemFontOfSize_(9.5))
+            self._textLabel.setFrame_(
+                Foundation.NSMakeRect(7, 3, b.size.width - 14, 13))
+            self._resetLabel.setHidden_(False)
+            self._resetLabel.setFrame_(
+                Foundation.NSMakeRect(7, 3, b.size.width - 14, 13))
 
     def setCompactMode_(self, compact):
         self._compact = compact
-        self.setNeedsDisplay_(True)
+        self._layoutLabels()
+        self._refresh()
 
     def setData_color_resetText_(self, pct, color, resetText):
         self._pct = pct
         self._barColor = color
         self._resetText = resetText
         self.setToolTip_(resetText or "")
-        self.setNeedsDisplay_(True)
+        self._refresh()
+
+    def _refresh(self):
+        pct = self._pct
+        if pct is not None and pct > 0:
+            track_w = self.bounds().size.width - 10
+            line_w = max(2, track_w * pct / 100.0)
+            self._line.setFrame_(Foundation.NSMakeRect(5, 2, line_w, 2))
+            self._line.layer().setBackgroundColor_(_ns_cgcolor(self._barColor))
+            self._line.setHidden_(False)
+        else:
+            self._line.setHidden_(True)
+        if self._compact:
+            self._textLabel.setStringValue_(
+                str(pct) if pct is not None else "—")
+        else:
+            pct_text = f"{pct}%" if pct is not None else "—"
+            self._textLabel.setStringValue_(f"{self._label.upper()} {pct_text}")
+            self._resetLabel.setStringValue_(self._resetText or "")
+
+    def hitTest_(self, point):
+        # Route clicks (even over the child labels) to this view so the detail
+        # popover fires.
+        if Foundation.NSPointInRect(point, self.frame()):
+            return self
+        return None
 
     def mouseDown_(self, event):
-        # Click on a metric bar shows a popover with details
         if self._key:
             show_metric_popover(self._key, self)
-
-    def drawRect_(self, rect):
-        # Full-height track — darker techno-blue slot
-        AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.04, 0.06, 0.13, 1.0).setFill()
-        AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            rect, 4, 4).fill()
-
-        # Empty track line at the bottom — very dim
-        line_x_pad = 5
-        line_y = 2.5             # baseline of the pulse line
-        line_w_max = rect.size.width - line_x_pad * 2
-
-        empty_rect = Foundation.NSMakeRect(
-            line_x_pad, line_y, line_w_max, 1.0)
-        AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.10, 1.0).setFill()
-        AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            empty_rect, 0.5, 0.5).fill()
-
-        # Pulsing glowing line for the percentage
-        if self._pct is not None and self._pct > 0:
-            phase = (time.time() * 1.6) % (2 * math.pi)
-            pulse = 0.5 + 0.5 * math.sin(phase)  # 0.0 → 1.0
-            line_w = max(2, line_w_max * self._pct / 100.0)
-
-            # Halo rings (largest first, dimmest) — extra ring for more glow
-            for radius, base_a in ((4, 0.04), (3, 0.09), (2, 0.16), (1, 0.26)):
-                halo = Foundation.NSMakeRect(
-                    line_x_pad - radius, line_y - radius,
-                    line_w + radius * 2, 1.0 + radius * 2)
-                a = base_a + 0.10 * pulse
-                self._barColor.colorWithAlphaComponent_(a).setFill()
-                AppKit.NSBezierPath\
-                    .bezierPathWithRoundedRect_xRadius_yRadius_(
-                        halo, radius + 0.5, radius + 0.5).fill()
-
-            # Hot core (1px solid line)
-            core = Foundation.NSMakeRect(
-                line_x_pad, line_y, line_w, 1.0)
-            core_alpha = 0.65 + 0.35 * pulse
-            self._barColor.colorWithAlphaComponent_(core_alpha).setFill()
-            AppKit.NSBezierPath\
-                .bezierPathWithRoundedRect_xRadius_yRadius_(
-                    core, 0.5, 0.5).fill()
-
-        # Compact mode (vertical layout): just the number centered, no %/label/reset
-        pct_text = f"{self._pct}%" if self._pct is not None else "—"
-        if self._compact:
-            num_text = (str(self._pct) if self._pct is not None
-                        else "—")
-            attrs = {
-                AppKit.NSForegroundColorAttributeName:
-                    AppKit.NSColor.whiteColor(),
-                AppKit.NSFontAttributeName:
-                    AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
-                        8.5, 0.0),
-            }
-            ns = AppKit.NSAttributedString.alloc()\
-                .initWithString_attributes_(num_text, attrs)
-            sz = ns.size()
-            ns.drawAtPoint_(Foundation.NSMakePoint(
-                (rect.size.width - sz.width) / 2, 4))
-            return
-
-        # Standard mode: "SESSION 42%" left, reset on right
-        left = f"{self._label.upper()} {pct_text}"
-        left_attrs = {
-            AppKit.NSForegroundColorAttributeName: AppKit.NSColor.whiteColor(),
-            AppKit.NSFontAttributeName:
-                AppKit.NSFont.systemFontOfSize_(9.5),
-        }
-        ns_left = AppKit.NSAttributedString.alloc()\
-            .initWithString_attributes_(left, left_attrs)
-        ly = 4
-        ns_left.drawAtPoint_(Foundation.NSMakePoint(7, ly))
-
-        if self._resetText:
-            right_attrs = {
-                AppKit.NSForegroundColorAttributeName:
-                    AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.98, 1.0),
-                AppKit.NSFontAttributeName:
-                    AppKit.NSFont.systemFontOfSize_(8.5),
-            }
-            ns_right = AppKit.NSAttributedString.alloc()\
-                .initWithString_attributes_(self._resetText, right_attrs)
-            rsize = ns_right.size()
-            ns_right.drawAtPoint_(Foundation.NSMakePoint(
-                rect.size.width - rsize.width - 7, ly + 0.5))
 
 
 class HoverButton(AppKit.NSButton):
@@ -392,69 +426,75 @@ class DraggableView(AppKit.NSView):
 
 
 class DragTabView(AppKit.NSView):
-    """Small grip area on the left edge — drags the window when clicked."""
+    """Small grip area on the left edge — drags the window when clicked.
+    Layer-backed with three grip dots drawn as tiny sublayers (drawRect_ would
+    not composite on macOS 26)."""
+
+    def initWithFrame_(self, frame):
+        self = objc.super(DragTabView, self).initWithFrame_(frame)
+        if self is None:
+            return None
+        self.setWantsLayer_(True)
+        cx = frame.size.width / 2.0
+        cy = frame.size.height / 2.0
+        dot_color = _ns_cgcolor(
+            AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.45, 1.0))
+        offsets = (-5, 0, 5) if frame.size.height >= frame.size.width \
+            else (-5, 0, 5)
+        for d in offsets:
+            dot = AppKit.NSView.alloc().initWithFrame_(
+                Foundation.NSMakeRect(cx - 1, cy + d - 1, 2, 2))
+            dot.setWantsLayer_(True)
+            dot.layer().setCornerRadius_(1)
+            dot.layer().setBackgroundColor_(dot_color)
+            self.addSubview_(dot)
+        return self
 
     def mouseDown_(self, event):
         self.window().performWindowDragWithEvent_(event)
 
-    def drawRect_(self, rect):
-        # Three small grip dots, vertically centered
-        AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.45, 1.0).setFill()
-        cx = rect.size.width / 2
-        cy = rect.size.height / 2
-        for dy in (-5, 0, 5):
-            dot = Foundation.NSMakeRect(cx - 1, cy + dy - 1, 2, 2)
-            AppKit.NSBezierPath.bezierPathWithOvalInRect_(dot).fill()
-
 
 class CountdownView(AppKit.NSView):
-    """Mini timer showing seconds until next refresh. Click cycles interval."""
+    """Mini timer showing seconds until next refresh. Click cycles interval.
+    Built from a layer-backed track + an NSTextField (not drawRect_)."""
 
     def initWithFrame_(self, frame):
         self = objc.super(CountdownView, self).initWithFrame_(frame)
+        if self is None:
+            return None
         self._secondsLeft = 0
         self._compact = False
+        self.setWantsLayer_(True)
+        self.layer().setCornerRadius_(4)
+        self.layer().setBackgroundColor_(_ns_cgcolor(
+            AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+                0.04, 0.06, 0.13, 1.0)))
+        self._label = _clear_label(9.5, white=0.85)
+        self._label.setAlignment_(AppKit.NSTextAlignmentCenter)
+        self._label.setFrame_(Foundation.NSMakeRect(
+            0, (frame.size.height - 12) / 2.0, frame.size.width, 12))
+        self._label.setAutoresizingMask_(AppKit.NSViewWidthSizable)
+        self.addSubview_(self._label)
+        self._render()
         return self
 
     def setCompactMode_(self, compact):
         self._compact = compact
-        self.setNeedsDisplay_(True)
+        self._label.setFont_(AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+            7.5 if compact else 9.5, 0.0))
+        self._render()
 
     def setSecondsLeft_(self, s):
         self._secondsLeft = max(0, int(s))
-        self.setNeedsDisplay_(True)
+        self._render()
+
+    def _render(self):
+        m, s = divmod(self._secondsLeft, 60)
+        self._label.setStringValue_(
+            f"{m}:{s:02d}" if self._compact else f"⟲ {m}:{s:02d}")
 
     def mouseDown_(self, event):
         cycle_refresh_interval()
-
-    def drawRect_(self, rect):
-        # Track bg
-        AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
-            0.04, 0.06, 0.13, 1.0).setFill()
-        AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-            rect, 4, 4).fill()
-
-        m, s = divmod(self._secondsLeft, 60)
-        if self._compact:
-            text = f"{m}:{s:02d}"
-            font_size = 7.5
-        else:
-            text = f"⟲ {m}:{s:02d}"
-            font_size = 9.5
-
-        attrs = {
-            AppKit.NSForegroundColorAttributeName:
-                AppKit.NSColor.colorWithCalibratedWhite_alpha_(0.85, 1.0),
-            AppKit.NSFontAttributeName:
-                AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
-                    font_size, 0.0),
-        }
-        ns = AppKit.NSAttributedString.alloc()\
-            .initWithString_attributes_(text, attrs)
-        sz = ns.size()
-        ns.drawAtPoint_(Foundation.NSMakePoint(
-            (rect.size.width - sz.width) / 2,
-            (rect.size.height - sz.height) / 2))
 
 
 def cycle_refresh_interval():
@@ -722,9 +762,11 @@ def build_compact_ui(target):
 
     view = DraggableView.alloc().initWithFrame_target_(
         Foundation.NSMakeRect(0, 0, w, h), target)
-    view.setWantsLayer_(True)
-    view.layer().setCornerRadius_(6)
-    view.layer().setMasksToBounds_(True)
+    # NOTE: deliberately NOT layer-backed. On macOS 26 a layer-backed,
+    # masksToBounds container in a borderless transparent window stops the
+    # non-layer-backed custom subviews (bars, countdown, grip) from
+    # compositing their drawRect_ output. Classic (non-layer) drawing works,
+    # and the rounded look still comes from DraggableView.drawRect_.
 
     rows = [("session", "Session"), ("all", "All"), ("sonnet", "Sonnet")]
 
@@ -1084,34 +1126,83 @@ def update_ui(data):
     update_menubar(data)
 
 
-def do_extract():
+def do_extract(on_done=None):
+    """Scrape the loaded page. Calls on_done(success) where success is True only
+    once real usage data (at least one percentage) was extracted — the SPA shows
+    "Loading" placeholders for a few seconds, so early attempts legitimately fail
+    and should be retried by the caller."""
     global g_webview
 
     def handle(result, error):
-        if error or not result:
-            return
-        try:
-            data = json.loads(result)
-        except Exception:
-            return
-        if not data.get("loggedIn"):
-            return
-        delegate = AppKit.NSApplication.sharedApplication().delegate()
-        switch_to_widget(delegate)
-        update_ui(data)
+        ok = False
+        if not error and result:
+            try:
+                data = json.loads(result)
+            except Exception:
+                data = None
+            if data and data.get("loggedIn") and any(
+                    data.get(k) is not None
+                    for k in ("sPct", "aPct", "nPct")):
+                global g_reload_retries
+                g_reload_retries = 0
+                delegate = AppKit.NSApplication.sharedApplication().delegate()
+                switch_to_widget(delegate)
+                update_ui(data)
+                ok = True
+        if on_done is not None:
+            on_done(ok)
 
-    g_webview.evaluateJavaScript_completionHandler_(EXTRACT_JS, handle)
+    if g_webview is not None:
+        g_webview.evaluateJavaScript_completionHandler_(EXTRACT_JS, handle)
+    elif on_done is not None:
+        on_done(False)
 
 
 # ── ObjC delegates ──
 
 class NavDelegate(AppKit.NSObject):
-    def webView_didFinishNavigation_(self, webView, navigation):
-        Foundation.NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            2.0, self, "onPageReady:", None, False)
+    # The usage panel lazy-loads after the document finishes, so we poll a few
+    # times rather than extracting once at a fixed delay (which used to race the
+    # load and usually lose, leaving the bars empty).
+    POLL_INTERVAL = 1.5
+    MAX_TRIES = 15   # ~22s of polling — comfortably longer than the load time
+    MAX_RELOADS = 6  # if a cold load is slow, reload a few times before idling
 
-    def onPageReady_(self, timer):
-        do_extract()
+    def webView_didFinishNavigation_(self, webView, navigation):
+        global g_extract_timer, g_extract_tries
+        g_extract_tries = 0
+        if g_extract_timer is not None:
+            g_extract_timer.invalidate()
+        g_extract_timer = Foundation.NSTimer\
+            .scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                self.POLL_INTERVAL, self, "pollExtract:", None, True)
+
+    def pollExtract_(self, timer):
+        global g_extract_tries, g_extract_timer
+        g_extract_tries += 1
+        tries = g_extract_tries
+
+        def done(ok):
+            global g_extract_timer, g_reload_retries
+            if ok:
+                if g_extract_timer is not None:
+                    g_extract_timer.invalidate()
+                    g_extract_timer = None
+            elif tries >= self.MAX_TRIES:
+                if g_extract_timer is not None:
+                    g_extract_timer.invalidate()
+                    g_extract_timer = None
+                # The page didn't surface usage data within the poll window
+                # (slow cold load). Reload to retry promptly rather than waiting
+                # for the next full refresh interval — bounded so a genuinely
+                # logged-out session doesn't reload forever.
+                if g_reload_retries < self.MAX_RELOADS and g_webview is not None:
+                    g_reload_retries += 1
+                    url = Foundation.NSURL.URLWithString_(USAGE_URL)
+                    g_webview.loadRequest_(
+                        Foundation.NSURLRequest.requestWithURL_(url))
+
+        do_extract(done)
 
 
 class AppDelegate(AppKit.NSObject):
