@@ -23,25 +23,33 @@ REFRESH_SECONDS = 5 * 60
 
 LOGIN_W, LOGIN_H = 400, 500
 
-# Single-row layout: drag tab + 3 bars + ↻ × buttons all inline
-BAR_H = 20
+# Single-row layout: drag tab + 4 bars + countdown + ⇌ ↻ × buttons all inline.
+# Half-height compact row: smaller fonts let BAR_H drop from 20 to 11.
+BAR_H = 11
+BAR_FONT = 7.5        # metric label font (was 9.5)
+RESET_FONT = 6.5      # reset / detail font (was 8.5)
 WIDGET_PAD = 4
 ROW_GAP = 2
-DRAG_TAB_W = 10
-BTN_W = 18
+DRAG_TAB_W = 8
+BTN_W = 11
 
-# All three sections share the same width (matches the session bar so its
-# longest reset string "4h 10m · 4:39am" fits comfortably).
-SESSION_BAR_W = 195
-ALL_BAR_W = SESSION_BAR_W
-SONNET_BAR_W = SESSION_BAR_W
-COUNTDOWN_W = 44
+# Session/All keep room for the long reset string "4h 10m · 4:39am". Sonnet is
+# usually 0% with no reset line, so it can be much narrower. Disk shows
+# "DISK 42%" + "320/994G".
+SESSION_BAR_W = 172
+ALL_BAR_W = 150
+SONNET_BAR_W = 90
+DISK_BAR_W = 122
+COUNTDOWN_W = 40
 
-# Horizontal: [pad][tab][gap][session][gap][all][gap][sonnet][gap][⏱][gap][↻⇌×][pad]
+NUM_METRICS = 4       # session, all, sonnet, disk
+
+# Horizontal: [pad][tab][session][all][sonnet][disk][⟲][⇌↻×][pad]
 H_WIDGET_W = (WIDGET_PAD + DRAG_TAB_W + 4
               + SESSION_BAR_W + ROW_GAP
               + ALL_BAR_W + ROW_GAP
               + SONNET_BAR_W + ROW_GAP
+              + DISK_BAR_W + ROW_GAP
               + COUNTDOWN_W
               + 4 + BTN_W * 3 + WIDGET_PAD)
 H_WIDGET_H = BAR_H
@@ -49,16 +57,16 @@ H_WIDGET_H = BAR_H
 # Refresh-interval choices (seconds) cycled by clicking the countdown
 REFRESH_INTERVAL_CHOICES = [60, 300, 900, 1800]  # 1m, 5m, 15m, 30m
 
-# Vertical (stacked) — long & thin, no wider than horizontal H (=BAR_H).
+# Vertical (stacked) — long & thin column.
 V_PAD = 2
 V_DRAG_H = 6
 V_GAP = 2
-V_BAR_H = 16          # bar (metric) height
+V_BAR_H = 14          # bar (metric) height
 V_BTN_W = 16          # button square size in vertical mode
-V_BAR_W = BAR_H - V_PAD * 2  # 16 — bar width = horizontal widget height minus pad
-V_WIDGET_W = BAR_H            # 20, exactly horizontal widget's height
+V_BAR_W = 16          # bar width in the vertical column
+V_WIDGET_W = 20       # column width
 V_WIDGET_H = (V_PAD + V_DRAG_H + 4
-              + V_BAR_H * 3 + V_GAP * 2
+              + V_BAR_H * NUM_METRICS + V_GAP * (NUM_METRICS - 1)
               + 3 + 12 + 3                  # countdown row
               + V_BTN_W * 3 + V_GAP * 2
               + V_PAD)
@@ -95,12 +103,15 @@ def save_prefs(prefs):
 # claude.ai/settings/usage is a lazy-loading SPA. The usage panel shows
 # "Loading" placeholders for a few seconds, then renders text like:
 #   Current session / Resets in 3 hr 8 min / 23% used
-#   All models      / Resets Tue 11:00 AM   / 3% used
-#   Sonnet only     / You haven't used Sonnet yet / 0% used   (no "Resets" line
-#                                                              when a metric is
-#                                                              unused)
-# We slice the body per section (header → next header) and pull the percentage
-# whether or not a "Resets" line is present, so unused metrics still parse.
+#   Weekly limits
+#     All models    / Resets Tue 11:00 AM   / 3% used
+#     Fable         / Resets Tue 11:00 AM   / 31% used   (model-specific; the
+#                                                          2nd weekly metric was
+#                                                          "Sonnet only", now
+#                                                          "Fable" — it changes)
+# Session + All models are matched by their fixed labels. The 2nd weekly metric
+# is parsed generically (its label is a model name that changes over time), so
+# we return its name too and the widget relabels that bar dynamically.
 EXTRACT_JS = r"""
 (function() {
     var data = {loggedIn: false};
@@ -123,14 +134,34 @@ EXTRACT_JS = r"""
                 reset: rm ? rm[1].trim() : ""};
     }
     var sess = section('Current session',
-        ['All models', 'Weekly limits', 'Sonnet only', 'Last updated']);
+        ['All models', 'Weekly limits', 'Last updated']);
     if (sess && sess.pct !== null) { data.sPct = sess.pct; data.sReset = sess.reset; }
     var all = section('All models',
-        ['Sonnet only', 'Last updated', 'Additional features']);
-    if (all && all.pct !== null) { data.aPct = all.pct; data.aReset = all.reset; }
-    var son = section('Sonnet only',
         ['Last updated', 'Additional features', 'Usage credits']);
-    if (son && son.pct !== null) { data.nPct = son.pct; data.nReset = son.reset; }
+    if (all && all.pct !== null) { data.aPct = all.pct; data.aReset = all.reset; }
+
+    // Second weekly metric — model-specific label (Sonnet, Fable, ...). Parse
+    // the weekly block by lines: each metric is [Name][Resets.../You haven't][N% used].
+    var wl = body.indexOf('Weekly limits');
+    var lu = body.indexOf('Last updated');
+    if (wl !== -1) {
+        var region = body.substring(wl, lu !== -1 ? lu : wl + 700);
+        var lines = region.split('\n')
+            .map(function(s) { return s.trim(); })
+            .filter(function(s) { return s.length; });
+        for (var i = 2; i < lines.length; i++) {
+            var m = lines[i].match(/^(\d+)%\s*used$/);
+            if (!m) continue;
+            var nm = lines[i - 2];
+            if (nm === 'All models' || /^Learn more/.test(nm)
+                || /^Weekly limits/.test(nm)) continue;
+            data.nName = nm;
+            data.nPct = parseInt(m[1], 10);
+            data.nReset = /^Resets/.test(lines[i - 1])
+                ? lines[i - 1].replace(/^Resets(\s+in)?\s+/, '') : "";
+            break;
+        }
+    }
     var pm = body.match(/Max \(([^)]+)\)/);
     if (pm) data.plan = pm[1];
     return JSON.stringify(data);
@@ -151,6 +182,7 @@ g_menubar_btn = None
 g_status_item = None       # NSStatusItem (menu bar item)
 g_status_menu_items = {}   # dict of NSMenuItems we update with usage data
 g_last_data = {}           # last fetched data, used to repopulate menubar item
+g_disk = {}                # last computed disk-usage snapshot
 g_countdown = None         # CountdownView instance
 g_last_refresh_time = 0.0  # time.time() of last successful page reload
 g_refresh_timer = None     # Foundation.NSTimer for auto-refresh
@@ -200,6 +232,7 @@ NEON_BLUE    = (0.05, 0.70, 1.0)   # #0DB3FF — electrifying tech blue
 NEON_MAGENTA = (1.0,  0.20, 0.78)  # #FF33C7 — vivid magenta
 NEON_AMBER   = (1.0,  0.66, 0.05)  # #FFA80D — warning
 NEON_PINK    = (1.0,  0.16, 0.55)  # #FF298C — critical
+NEON_TEAL    = (0.10, 0.90, 0.72)  # #1AE6B8 — disk / storage
 
 
 def color_for_pct(pct):
@@ -279,40 +312,43 @@ class MetricBarView(AppKit.NSView):
                 0.04, 0.06, 0.13, 1.0)))
         self.addSubview_(self._track)
 
-        # Colored progress line near the bottom
+        # Colored progress line along the bottom edge
         self._line = AppKit.NSView.alloc().initWithFrame_(
-            Foundation.NSMakeRect(5, 2, 0, 2))
+            Foundation.NSMakeRect(5, 1, 0, 2))
         self._line.setWantsLayer_(True)
         self._line.layer().setCornerRadius_(1)
         self.addSubview_(self._line)
 
         # Text labels (left = label+pct, right = reset time)
-        self._textLabel = _clear_label(9.5)
+        self._textLabel = _clear_label(BAR_FONT)
         self.addSubview_(self._textLabel)
-        self._resetLabel = _clear_label(8.5, white=0.98)
+        self._resetLabel = _clear_label(RESET_FONT, white=0.98)
         self._resetLabel.setAlignment_(AppKit.NSTextAlignmentRight)
         self.addSubview_(self._resetLabel)
 
         self._layoutLabels()
+        self._refresh()   # show the "—" placeholder until data arrives
         return self
 
     def _layoutLabels(self):
         b = self.bounds()
+        h = b.size.height
         if self._compact:
             self._textLabel.setAlignment_(AppKit.NSTextAlignmentCenter)
             self._textLabel.setFont_(
-                AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(8.5, 0.0))
-            self._textLabel.setFrame_(Foundation.NSMakeRect(
-                0, (b.size.height - 12) / 2.0, b.size.width, 12))
+                AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
+                    BAR_FONT, 0.0))
+            self._textLabel.setFrame_(
+                Foundation.NSMakeRect(0, (h - 10) / 2.0, b.size.width, 10))
             self._resetLabel.setHidden_(True)
         else:
             self._textLabel.setAlignment_(AppKit.NSTextAlignmentLeft)
-            self._textLabel.setFont_(AppKit.NSFont.systemFontOfSize_(9.5))
+            self._textLabel.setFont_(AppKit.NSFont.systemFontOfSize_(BAR_FONT))
             self._textLabel.setFrame_(
-                Foundation.NSMakeRect(7, 3, b.size.width - 14, 13))
+                Foundation.NSMakeRect(6, 0, b.size.width - 12, h))
             self._resetLabel.setHidden_(False)
             self._resetLabel.setFrame_(
-                Foundation.NSMakeRect(7, 3, b.size.width - 14, 13))
+                Foundation.NSMakeRect(6, 0, b.size.width - 12, h))
 
     def setCompactMode_(self, compact):
         self._compact = compact
@@ -331,7 +367,7 @@ class MetricBarView(AppKit.NSView):
         if pct is not None and pct > 0:
             track_w = self.bounds().size.width - 10
             line_w = max(2, track_w * pct / 100.0)
-            self._line.setFrame_(Foundation.NSMakeRect(5, 2, line_w, 2))
+            self._line.setFrame_(Foundation.NSMakeRect(5, 1, line_w, 2))
             self._line.layer().setBackgroundColor_(_ns_cgcolor(self._barColor))
             self._line.setHidden_(False)
         else:
@@ -469,10 +505,12 @@ class CountdownView(AppKit.NSView):
         self.layer().setBackgroundColor_(_ns_cgcolor(
             AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
                 0.04, 0.06, 0.13, 1.0)))
-        self._label = _clear_label(9.5, white=0.85)
+        self._label = _clear_label(BAR_FONT, white=0.85)
+        self._label.setFont_(
+            AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(BAR_FONT, 0.0))
         self._label.setAlignment_(AppKit.NSTextAlignmentCenter)
         self._label.setFrame_(Foundation.NSMakeRect(
-            0, (frame.size.height - 12) / 2.0, frame.size.width, 12))
+            0, (frame.size.height - 10) / 2.0, frame.size.width, 10))
         self._label.setAutoresizingMask_(AppKit.NSViewWidthSizable)
         self.addSubview_(self._label)
         self._render()
@@ -481,7 +519,7 @@ class CountdownView(AppKit.NSView):
     def setCompactMode_(self, compact):
         self._compact = compact
         self._label.setFont_(AppKit.NSFont.monospacedDigitSystemFontOfSize_weight_(
-            7.5 if compact else 9.5, 0.0))
+            6.5 if compact else BAR_FONT, 0.0))
         self._render()
 
     def setSecondsLeft_(self, s):
@@ -580,6 +618,9 @@ def _color_for_key(key):
         return NEON_BLUE
     if key == "all":
         return NEON_MAGENTA
+    if key == "disk":
+        pct = g_disk.get("pct", 0)
+        return NEON_PINK if pct >= 85 else NEON_TEAL
     pct = g_last_data.get("nPct")
     if pct is None or pct < 50:
         return NEON_BLUE
@@ -620,11 +661,21 @@ def _stats_for_key(key):
             ("Used", f"{d.get('aPct', '—')}%"),
             ("Resets", d.get("aReset", "—")),
         ]
-    # sonnet
+    if key == "disk":
+        di = g_disk or {}
+        return [
+            ("Volume", "Macintosh HD"),
+            ("Used", f"{di.get('pct', '—')}%"),
+            ("Used space", _fmt_gb(di["used"]) if di.get("used") else "—"),
+            ("Free", _fmt_gb(di["free"]) if di.get("free") else "—"),
+            ("Total", _fmt_gb(di["total"]) if di.get("total") else "—"),
+        ]
+    # second weekly metric (model-specific: Sonnet, Fable, ...)
     return [
-        ("Type", "Sonnet only"),
+        ("Model", d.get("nName", "—")),
+        ("Type", "Weekly limit"),
         ("Used", f"{d.get('nPct', '—')}%"),
-        ("Resets", d.get("nReset", "—")),
+        ("Resets", d.get("nReset") or "—"),
     ]
 
 
@@ -686,11 +737,14 @@ def show_metric_popover(key, anchor_view):
     content.setWantsLayer_(True)
 
     # Title
-    title_text = {
-        "session": "SESSION",
-        "all": "ALL MODELS",
-        "sonnet": "SONNET ONLY",
-    }[key]
+    if key == "sonnet":
+        title_text = (g_last_data.get("nName") or "Sonnet").upper()
+    else:
+        title_text = {
+            "session": "SESSION",
+            "all": "ALL MODELS",
+            "disk": "DISK SPACE",
+        }[key]
     accent_color = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
         accent[0], accent[1], accent[2], 1.0)
     title = AppKit.NSTextField.labelWithString_(title_text)
@@ -768,7 +822,8 @@ def build_compact_ui(target):
     # compositing their drawRect_ output. Classic (non-layer) drawing works,
     # and the rounded look still comes from DraggableView.drawRect_.
 
-    rows = [("session", "Session"), ("all", "All"), ("sonnet", "Sonnet")]
+    rows = [("session", "Session"), ("all", "All"),
+            ("sonnet", "Sonnet"), ("disk", "Disk")]
 
     if vertical:
         # Tall thin column. Width = horizontal widget's height.
@@ -795,7 +850,8 @@ def build_compact_ui(target):
 
         # Countdown row between bars and buttons
         countdown_h = 12
-        cd_y = bar_top - V_BAR_H * 3 - V_GAP * 2 - 3 - countdown_h
+        cd_y = (bar_top - V_BAR_H * NUM_METRICS - V_GAP * (NUM_METRICS - 1)
+                - 3 - countdown_h)
         g_countdown = CountdownView.alloc().initWithFrame_(
             Foundation.NSMakeRect(col_x, cd_y, col_w, countdown_h))
         g_countdown.setCompactMode_(True)
@@ -819,11 +875,12 @@ def build_compact_ui(target):
             Foundation.NSMakeRect(WIDGET_PAD, 0, DRAG_TAB_W, h))
         view.addSubview_(tab)
 
-        # 3 bars in a row — session is wider, sonnet is narrower
+        # Bars in a row — session/all wide, sonnet narrow, then disk.
         x = WIDGET_PAD + DRAG_TAB_W + 4
         bar_widths = {"session": SESSION_BAR_W,
                       "all": ALL_BAR_W,
-                      "sonnet": SONNET_BAR_W}
+                      "sonnet": SONNET_BAR_W,
+                      "disk": DISK_BAR_W}
         for key, label in rows:
             bw = bar_widths[key]
             bar = MetricBarView.alloc().initWithFrame_label_(
@@ -845,14 +902,14 @@ def build_compact_ui(target):
         bx = x + 2
         view.addSubview_(_make_btn(
             target, Foundation.NSMakeRect(bx, btn_y, BTN_W, BTN_W),
-            "\u21cc", target.toggleRotation_, 12))
+            "\u21cc", target.toggleRotation_, 9))
         view.addSubview_(_make_btn(
             target, Foundation.NSMakeRect(bx + BTN_W, btn_y, BTN_W, BTN_W),
-            "\u21bb", target.manualRefresh_, 13))
+            "\u21bb", target.manualRefresh_, 10))
         view.addSubview_(_make_btn(
             target,
             Foundation.NSMakeRect(bx + BTN_W * 2, btn_y, BTN_W, BTN_W),
-            "\u00d7", target.closeWidget_, 15))
+            "\u00d7", target.closeWidget_, 11))
 
     return view
 
@@ -1119,11 +1176,50 @@ def update_ui(data):
                 color = all_color
             else:
                 color = color_for_pct(pct)
+                # 2nd weekly metric is model-specific — relabel it (Fable, etc.)
+                name = (data.get("nName") or "Sonnet").replace(" only", "")
+                g_bars[key]._label = name
             reset = data.get(reset_key, "")
             short = shorten_reset(reset, is_session)
             g_bars[key].setData_color_resetText_(pct, color, short)
 
+    update_disk()
     update_menubar(data)
+
+
+def _fmt_gb(nbytes):
+    # Base-10 units to match how macOS reports storage ("About This Mac").
+    gb = nbytes / (1000 ** 3)
+    if gb >= 1000:
+        return f"{gb / 1000:.1f}T"
+    return f"{gb:.0f}G"
+
+
+def get_disk_info(path="/"):
+    """Return (used_pct, 'used/total' string, detail dict) for `path`'s volume."""
+    import shutil
+    total, used, free = shutil.disk_usage(path)
+    pct = int(round(used / total * 100)) if total else 0
+    return pct, f"{_fmt_gb(used)}/{_fmt_gb(total)}", {
+        "used": used, "free": free, "total": total, "pct": pct}
+
+
+def update_disk():
+    """Refresh the local disk-usage bar (independent of the web scrape)."""
+    global g_disk
+    if "disk" not in g_bars:
+        return
+    try:
+        pct, label, info = get_disk_info("/")
+    except Exception:
+        return
+    g_disk = info
+    if pct >= 85:
+        color = color_for_pct(pct)          # warn amber/red when nearly full
+    else:
+        color = AppKit.NSColor.colorWithCalibratedRed_green_blue_alpha_(
+            *NEON_TEAL, 1.0)
+    g_bars["disk"].setData_color_resetText_(pct, color, label)
 
 
 def do_extract(on_done=None):
